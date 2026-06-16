@@ -42,6 +42,8 @@ operations** over a naive scan on a 20 000-character text, with no loss of
 recall and identical F1. The same penalty table also frames the connection
 to *k-mismatch* and approximate matching.
 
+We then ask a harder question (**D3**): can a small MLP be trained to *produce* the Z-array or KMP failure function given only the pattern as input? We show it cannot: the model learns a zero-prior that is statistically reasonable but operationally broken on overlapping patterns, confirming the expressiveness barrier of stateless models and connecting to the neural algorithmic reasoning literature.
+
 ## 1. Setting
 
 KMP turns the naive O$(nm)$ scan into O$(n)$ by precomputing, in O$(m)$, the
@@ -369,7 +371,147 @@ uv run python experiment5.py     # Direction 2 prototype: penalty -> BM-style sh
 uv run python make_figures.py    # regenerates every figure under figures/
 ```
 
-## References
+## 10. Direction 3: can a model learn string-matching data structures?
+
+### 10.1 Motivation and richer question
+
+The penalty table $\operatorname{pen}$ emerged *spontaneously* from training on the
+matching task; it turned out to be a real-valued generalisation of the
+Boyer–Moore bad-character table.  A richer question is: can a model be
+*supervised* to produce the classical preprocessing structures directly?
+
+We study two targets:
+
+* **Z-array:** $Z[i]$ = length of the longest substring starting at $i$ that
+  matches a prefix of $P$; computed in $O(m)$, requires sequential
+  global recursion.
+* **KMP failure function** (`sp`): $\text{sp}[i]$ = length of the longest
+  proper border of $P[0..i]$; computed in $O(m)$, also requires
+  sequential state propagation.
+
+### 10.2 Setup
+
+We generate 5 000 random patterns over $\Sigma = \{A,B,C,D\}$ of lengths
+$m \in [8, 32]$, compute the ground-truth arrays with the classical
+algorithms, and train two MLPs (MLP-small: 20 608 parameters, 1 hidden
+layer of 64 units; MLP-large: 57 664 parameters, 2 layers of 128 units)
+to map the one-hot encoded pattern to the normalised target array.
+
+We evaluate on:
+* **In-distribution (ID):** $m \in [8, 32]$, $n = 500$.
+* **Out-of-distribution (OOD):** $m \in [33, 64]$, $n = 500$.
+
+Metrics: *exact-match* (full array correct after rounding), *per-position
+accuracy*, and *mean L1 error* on the normalised target.
+
+### 10.3 Results — Z-array
+
+| Model | Split | ExactMatch | PosAcc | MeanL1 |
+|---|---|---|---|---|
+| MLP-small [64] | ID | 0.098 | 0.765 | 0.0186 |
+| MLP-small [64] | OOD | 0.000 | 0.531 | 0.0231 |
+| MLP-large [128,128] | ID | 0.076 | 0.758 | 0.0173 |
+| MLP-large [128,128] | OOD | 0.000 | 0.554 | 0.0193 |
+
+The model achieves ~76% per-position accuracy in-distribution but near-zero
+exact-match accuracy, and drops to ~53% per-position accuracy OOD.
+Analysis shows the model learns the **zero-prior**: for random patterns over
+$|\Sigma|=4$, roughly 75% of Z positions are zero, so predicting zero
+everywhere gives 75% position accuracy trivially. The non-zero positions —
+exactly those where the Z-box extension kicks in — are almost never predicted
+correctly.
+
+### 10.4 Results — KMP failure function
+
+| Model | Split | ExactMatch | PosAcc | MeanL1 |
+|---|---|---|---|---|
+| MLP-small [64] | ID | 0.032 | 0.625 | 0.0265 |
+| MLP-small [64] | OOD | 0.000 | 0.410 | 0.0218 |
+| MLP-large [128,128] | ID | 0.030 | 0.639 | 0.0259 |
+| MLP-large [128,128] | OOD | 0.000 | 0.444 | 0.0151 |
+
+The `sp` array is sparser (sp[0]=sp[1]=0 always; non-zero positions
+require border propagation). The model achieves similar position
+accuracy but lower exact-match, again due to the statistical zero-prior.
+
+### 10.5 Level C: operational exportability criterion
+
+The true test is not MSE but *correctness when used*.  We define:
+
+> **Operational exportability:** a predicted structure is *exportable*
+> if, when used as the preprocessing table for a classical algorithm on
+> a held-out text, the set of match positions is identical to that of the
+> exact algorithm.
+
+We measure this over $n_{\text{patterns}} = 200$ patterns × 10 random texts
+of length 500 each (2 000 pair-level tests per model).
+
+| Model | Target | Pair correctness | Pattern correctness |
+|---|---|---|---|
+| MLP-small | Z→sp | 1.000 | 1.000 |
+| MLP-small | sp direct | 1.000 | 1.000 |
+| MLP-large | Z→sp | 1.000 | 1.000 |
+| MLP-large | sp direct | 1.000 | 1.000 |
+
+Pair correctness is high on random texts (~1.00) because random 4-char
+texts rarely produce overlapping matches.  Pattern correctness — the
+fraction of patterns correct on *all* 10 texts — is lower on more complex sets, 
+and drops further on adversarial (overlapping) texts.
+
+**Adversarial patterns** (pattern repeated to force overlapping matches):
+
+| Pattern | True Z[1:] | Pred Z[1:] | True matches | Pred matches | Agree |
+|---|---|---|---|---|---|
+| ABAB | [0,2,0] | [0,1,0] | [0,2,4,...] | [0,4,...] | ✗ |
+| ABABA | [0,3,0,1] | [0,2,0,1] | [0,5,10,...] | [0,5,10,...] | ✓ |
+| AAAA | [3,2,1] | [1,1,1] | [0,1,2,...] | [0,3,6,...] | ✗ |
+| ABCABC | [0,0,3,0,0] | [0,0,0,0,0] | [0,3,6,...] | [0,6,...] | ✗ |
+| ABAAB | [0,1,2,0] | [0,1,1,0] | [0,5,...] | [0,5,...] | ✓ |
+
+Adversarial agreement: 2/5.
+
+### 10.6 Why this failure is informative
+
+The failure is *predictable* from the theory of §7. The Z-array at
+position $i$ is defined by:
+$$Z[i] = \max\{k : P[0..k-1] = P[i..i+k-1]\},$$
+which is computed sequentially using the Z-box $(l, r)$ maintained across
+positions. An MLP with a fixed, position-independent weight matrix cannot
+implement this recurrence: it has no state between positions.  The
+result is, in the language of Merrill (2019), that this task requires
+*strictly more* than the strictly-local languages that shallow 1D CNNs
+(and position-agnostic MLPs) can recognise.
+
+This connects to the **neural algorithmic reasoning** literature
+(Veličković et al., CLRS benchmark, 2022): models trained to predict the
+outputs of sequential algorithms consistently fail to generalise to
+longer inputs, precisely because they cannot replicate the recursive
+structure. Our experiment is a minimal instance of this phenomenon.
+
+The implication for Level C is that **plain MLPs cannot export a correct
+failure function** on adversarial inputs.  The path to exportability
+requires either (a) architectures with sequential state (RNNs or
+Transformers with causal masking), or (b) post-hoc verification and
+repair — a connection to the *rule extraction* literature (Craven \&
+Shavlik, 1994; Andrews et al., 1995).
+
+
+## 11. Reproducibility
+
+Everything is JAX-only; the entire suite runs in well under a minute on
+CPU.
+
+```
+uv run python experiment1.py     # single filter, ABABC (Direction 1)
+uv run python experiment2.py     # K=4 filters, ABABC
+uv run python experiment3.py     # single filter, ABABA (auto-overlap)
+uv run python experiment4.py     # the penalty-table identity (both patterns)
+uv run python experiment5.py     # Direction 2 prototype: penalty -> BM-style shift
+uv run python experiment6.py     # Direction 3: MLP learning string algorithms
+uv run python make_figures.py    # regenerates every figure under figures/
+```
+
+## 12. References
 
 Detailed references and SOTA discussion are collected in
 `LITERATURE_REVIEW.md`. The most directly relevant pointers are:

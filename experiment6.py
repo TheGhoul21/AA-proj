@@ -77,6 +77,21 @@ def z_array_normalised(p: str, pad_to: int | None = None) -> np.ndarray:
     return arr
 
 
+def sp_normalised(p: str, pad_to: int | None = None) -> np.ndarray:
+    """KMP failure function sp, normalised by m-1 (so values in [0,1]); padded."""
+    from patterns import kmp_failure
+    m = len(p)
+    L = pad_to if pad_to is not None else m
+    sp = kmp_failure(p)
+    # sp[0] is always 0; sp[i] in [0, i]; normalise by m (consistent with Z)
+    arr = np.array(sp, dtype=np.float32) / m
+    if pad_to is not None:
+        padded = np.zeros(L, dtype=np.float32)
+        padded[:m] = arr
+        return padded
+    return arr
+
+
 class Dataset(NamedTuple):
     x: np.ndarray   # (N, L, SIGMA)
     y: np.ndarray   # (N, L)  — normalised Z-array, padded
@@ -97,6 +112,29 @@ def build_z_dataset(
         p = random_pattern(m)
         xs.append(pattern_to_onehot(p, pad_to=pad_to))
         ys.append(z_array_normalised(p, pad_to=pad_to))
+        ls.append(m)
+        ps.append(p)
+    return Dataset(
+        x=np.array(xs, dtype=np.float32),
+        y=np.array(ys, dtype=np.float32),
+        lengths=np.array(ls, dtype=np.int32),
+        patterns=ps,
+    )
+
+
+def build_sp_dataset(
+    n_samples: int,
+    min_len: int,
+    max_len: int,
+    pad_to: int,
+) -> Dataset:
+    """Build a dataset of (pattern_onehot, sp_normalised) pairs."""
+    xs, ys, ls, ps = [], [], [], []
+    for _ in range(n_samples):
+        m = random.randint(min_len, max_len)
+        p = random_pattern(m)
+        xs.append(pattern_to_onehot(p, pad_to=pad_to))
+        ys.append(sp_normalised(p, pad_to=pad_to))
         ls.append(m)
         ps.append(p)
     return Dataset(
@@ -259,6 +297,54 @@ def evaluate_z_model(
     return result
 
 
+def evaluate_sp_model(
+    params: dict,
+    ds: Dataset,
+    model_fn,
+    pad_to: int,
+    name: str = "",
+) -> dict:
+    """Evaluate sp prediction quality.
+    Metrics:
+      exact_match: fraction of patterns where all sp[1:] are correct after rounding
+      pos_accuracy: fraction of positions 1..m-1 correct
+      mean_l1: mean L1 error on normalised sp (positions 1..m-1)
+    """
+    from patterns import kmp_failure
+    x = jnp.array(ds.x)
+    preds_raw = np.array(model_fn(params, x))   # (N, L)
+
+    exact_matches = 0
+    total_positions = 0
+    correct_positions = 0
+    total_l1 = 0.0
+
+    for i, (p, m) in enumerate(zip(ds.patterns, ds.lengths)):
+        sp_true = np.array(kmp_failure(p))          # (m,) integers
+        pred_norm = preds_raw[i, 1:m]               # (m-1,)
+        pred_int = np.clip(np.round(pred_norm * m), 0, m - 1)
+        true_int = sp_true[1:].astype(float)
+
+        is_correct = (pred_int == true_int)
+        correct_positions += is_correct.sum()
+        total_positions += len(true_int)
+        total_l1 += np.abs(pred_norm - (true_int / m)).sum()
+        if is_correct.all():
+            exact_matches += 1
+
+    n = len(ds.patterns)
+    result = {
+        "exact_match": exact_matches / n,
+        "pos_accuracy": correct_positions / total_positions,
+        "mean_l1": total_l1 / total_positions,
+        "n": n,
+    }
+    label = f"[{name}] " if name else ""
+    print(f"  {label}n={n}  exact_match={result['exact_match']:.3f}  "
+          f"pos_acc={result['pos_accuracy']:.3f}  mean_l1={result['mean_l1']:.4f}")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Correctness check: plug predicted Z into a KMP-style search
 # ---------------------------------------------------------------------------
@@ -291,7 +377,11 @@ def kmp_search_with_sp(text: str, pattern: str, sp: list[int]) -> list[int]:
     k = 0
     for pos, c in enumerate(text):
         while k > 0 and (k >= m or pattern[k] != c):
-            k = sp[k - 1]
+            next_k = sp[k - 1]
+            if next_k >= k:  # Prevent infinite loop from malformed predicted sp
+                k = 0
+                break
+            k = next_k
         if k < m and pattern[k] == c:
             k += 1
         if k == m:
@@ -402,6 +492,76 @@ def check_adversarial_patterns(params: dict, model_fn, pad_to: int) -> None:
     print(f"  Adversarial agreement: {agree_count}/{len(hard_patterns)}")
 
 
+def level_c_correctness(
+    params: dict,
+    ds: Dataset,
+    model_fn,
+    pad_to: int,
+    n_patterns: int = 200,
+    n_texts_per_pattern: int = 10,
+    text_length: int = 500,
+    target: str = "Z",   # "Z" or "sp"
+) -> dict:
+    """Level C: operational exportability criterion.
+
+    For each of n_patterns patterns, generate n_texts_per_pattern random texts.
+    Compare:
+      - exact KMP (ground-truth sp)
+      - learned KMP (predicted sp derived from predicted Z or sp directly)
+
+    Returns:
+      pair_correctness:   fraction of (pattern, text) pairs with identical matches
+      pattern_correctness: fraction of patterns correct on ALL their texts
+      total_pairs:        n_patterns * n_texts_per_pattern
+    """
+    from patterns import kmp_search, kmp_failure
+
+    x = jnp.array(ds.x[:n_patterns])
+    preds_raw = np.array(model_fn(params, x))
+
+    pair_agreements = 0
+    pattern_all_correct = 0
+    total_pairs = n_patterns * n_texts_per_pattern
+
+    for i, (p, m) in enumerate(zip(ds.patterns[:n_patterns], ds.lengths[:n_patterns])):
+        pred_norm = preds_raw[i, :m]
+
+        if target == "Z":
+            pred_vals = [m] + [
+                int(np.clip(round(float(pred_norm[j]) * m), 0, m))
+                for j in range(1, m)
+            ]
+            pred_sp = z_to_sp(pred_vals)
+        else:  # "sp"
+            pred_sp = [0] + [
+                int(np.clip(round(float(pred_norm[j]) * m), 0, m - 1))
+                for j in range(1, m)
+            ]
+
+        pattern_correct = True
+        for _ in range(n_texts_per_pattern):
+            text = "".join(random.choices(ALPHABET, k=text_length))
+            true_m = set(kmp_search(text, p))
+            pred_m = set(kmp_search_with_sp(text, p, pred_sp))
+            if true_m == pred_m:
+                pair_agreements += 1
+            else:
+                pattern_correct = False
+        if pattern_correct:
+            pattern_all_correct += 1
+
+    result = {
+        "pair_correctness":    pair_agreements / total_pairs,
+        "pattern_correctness": pattern_all_correct / n_patterns,
+        "total_pairs":         total_pairs,
+    }
+    print(f"  Level C  target={target}  "
+          f"pair_correctness={result['pair_correctness']:.3f}  "
+          f"pattern_correctness={result['pattern_correctness']:.3f}  "
+          f"({total_pairs} pairs, {n_patterns} patterns × {n_texts_per_pattern} texts)")
+    return result
+
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -506,26 +666,94 @@ def main() -> None:
         ood_corr = check_correctness(params, val_ood, fwd_fn, PAD_TO, n_check=100)
         check_adversarial_patterns(params, fwd_fn, PAD_TO)
 
+        print("\nLevel C — aggregate operational correctness:")
+        lc_z  = level_c_correctness(params, val_id, fwd_fn, PAD_TO,
+                                     n_patterns=200, target="Z")
         results[label] = {
             "ID":  {**id_res,  **id_corr},
             "OOD": {**ood_res, **ood_corr},
+            "LC": lc_z,
+        }
+
+    # -----------------------------------------------------------------------
+    # Level B — sp (KMP failure function) target
+    # -----------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("Level B — sp (KMP failure function) target")
+    print("=" * 60)
+
+    sp_train_ds = build_sp_dataset(N_TRAIN, TRAIN_MIN, TRAIN_MAX, PAD_TO)
+    sp_val_id   = build_sp_dataset(N_VAL_ID, TRAIN_MIN, TRAIN_MAX, PAD_TO)
+    sp_val_ood  = build_sp_dataset(N_VAL_OOD, OOD_MIN, OOD_MAX, PAD_TO)
+    sp_results  = {}
+
+    for label, hidden_sizes in [
+        ("MLP-small [64]", [64]),
+        ("MLP-large [128,128]", [128, 128]),
+    ]:
+        print(f"\n{'='*50}")
+        print(f"Model: {label}  (sp target)")
+        print(f"{'='*50}")
+
+        init_fn, fwd_fn = make_mlp_model(hidden_sizes)
+        key, subkey = jax.random.split(key)
+        params = init_fn(subkey)
+
+        print(f"\nTraining ({N_EPOCHS} epochs)...")
+        params = train_model(
+            params, sp_train_ds, N_EPOCHS, BATCH_SIZE, LR,
+            fwd_fn, PAD_TO, log_every=30,
+        )
+
+        print("\nEvaluation:")
+        print("  In-distribution (lengths 8–32):")
+        id_res  = evaluate_sp_model(params, sp_val_id, fwd_fn, PAD_TO, name="ID")
+        print("  Out-of-distribution (lengths 33–64):")
+        ood_res = evaluate_sp_model(params, sp_val_ood, fwd_fn, PAD_TO, name="OOD")
+
+        print("\nLevel C — sp target, operational correctness:")
+        lc_sp = level_c_correctness(params, sp_val_id, fwd_fn, PAD_TO,
+                                     n_patterns=200, target="sp")
+
+        sp_results[label] = {
+            "ID": id_res, "OOD": ood_res, "LC": lc_sp,
         }
 
     # -----------------------------------------------------------------------
     # Summary table
     # -----------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("SUMMARY TABLE")
-    print("=" * 70)
+    print("\n" + "=" * 100)
+    print("SUMMARY TABLE (Z-array target)")
+    print("=" * 100)
     print(f"{'Model':<25} {'Split':<5} {'ExactMatch':>10} {'PosAcc':>8} "
-          f"{'MeanL1':>8} {'Correct':>8}")
-    print("-" * 70)
+          f"{'MeanL1':>8} {'Correct':>8} {'LC-Pair':>8} {'LC-Pat':>8}")
+    print("-" * 100)
     for model_name, splits in results.items():
-        for split_name, r in splits.items():
+        for split_name in ["ID", "OOD"]:
+            r = splits[split_name]
+            # ID has LC metric, OOD doesn't
+            lc_pair = f"{splits['LC']['pair_correctness']:.3f}" if split_name == "ID" else "N/A"
+            lc_pat  = f"{splits['LC']['pattern_correctness']:.3f}" if split_name == "ID" else "N/A"
             print(f"{model_name:<25} {split_name:<5} "
                   f"{r['exact_match']:>10.3f} {r['pos_accuracy']:>8.3f} "
-                  f"{r['mean_l1']:>8.4f} {r['correctness']:>8.3f}")
-    print("=" * 70)
+                  f"{r['mean_l1']:>8.4f} {r['correctness']:>8.3f} {lc_pair:>8} {lc_pat:>8}")
+    print("=" * 100)
+
+    print("\n" + "=" * 100)
+    print("SUMMARY TABLE (sp target)")
+    print("=" * 100)
+    print(f"{'Model':<25} {'Split':<5} {'ExactMatch':>10} {'PosAcc':>8} "
+          f"{'MeanL1':>8} {'LC-Pair':>8} {'LC-Pat':>8}")
+    print("-" * 100)
+    for model_name, splits in sp_results.items():
+        for split_name in ["ID", "OOD"]:
+            r = splits[split_name]
+            lc_pair = f"{splits['LC']['pair_correctness']:.3f}" if split_name == "ID" else "N/A"
+            lc_pat  = f"{splits['LC']['pattern_correctness']:.3f}" if split_name == "ID" else "N/A"
+            print(f"{model_name:<25} {split_name:<5} "
+                  f"{r['exact_match']:>10.3f} {r['pos_accuracy']:>8.3f} "
+                  f"{r['mean_l1']:>8.4f} {lc_pair:>8} {lc_pat:>8}")
+    print("=" * 100)
 
     # -----------------------------------------------------------------------
     # Interpretation
