@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+*.so
+*.dylib
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+# uv.lock is intentionally tracked (reproducible installs)
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+*.ipynb
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Secrets / local config
+.env
+.env.*
+secrets.json
+
+# Compiled LaTeX
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.blg
+*.bbl
+
+# Generated outputs (keep figures/ source, ignore large generated artefacts if any)
+# Uncomment if you want to ignore the PDF:
+# paper.pdf
+
+# Claude internal
+.claude/
