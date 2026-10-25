@@ -598,6 +598,55 @@ def make_mlp_model(hidden_sizes: list[int]):
     return init, forward
 
 
+def gru_init(key: jax.Array, input_dim: int, hidden_size: int) -> dict:
+    """Initialise GRU parameters."""
+    keys = jax.random.split(key, 8)
+    scale_x = np.sqrt(2.0 / (input_dim + hidden_size))
+    scale_h = np.sqrt(2.0 / (hidden_size + hidden_size))
+    scale_out = np.sqrt(2.0 / hidden_size)
+
+    return {
+        "W_z": jax.random.normal(keys[0], (input_dim, hidden_size)) * scale_x,
+        "U_z": jax.random.normal(keys[1], (hidden_size, hidden_size)) * scale_h,
+        "b_z": jnp.zeros((hidden_size,)),
+
+        "W_r": jax.random.normal(keys[2], (input_dim, hidden_size)) * scale_x,
+        "U_r": jax.random.normal(keys[3], (hidden_size, hidden_size)) * scale_h,
+        "b_r": jnp.zeros((hidden_size,)),
+
+        "W_h": jax.random.normal(keys[4], (input_dim, hidden_size)) * scale_x,
+        "U_h": jax.random.normal(keys[5], (hidden_size, hidden_size)) * scale_h,
+        "b_h": jnp.zeros((hidden_size,)),
+
+        "W_out": jax.random.normal(keys[6], (hidden_size,)) * scale_out,
+        "b_out": jnp.zeros(()),
+    }
+
+
+def make_gru_model(hidden_size: int = 64):
+    """Return (init_fn, forward_fn) for a sequential GRU model mapping (B, L, SIGMA) -> (B, L)."""
+    def init(key):
+        return gru_init(key, SIGMA, hidden_size)
+
+    def forward_single(params, x_seq):
+        def cell(h_prev, x_t):
+            z_t = jax.nn.sigmoid(jnp.dot(x_t, params["W_z"]) + jnp.dot(h_prev, params["U_z"]) + params["b_z"])
+            r_t = jax.nn.sigmoid(jnp.dot(x_t, params["W_r"]) + jnp.dot(h_prev, params["U_r"]) + params["b_r"])
+            h_tilde = jnp.tanh(jnp.dot(x_t, params["W_h"]) + jnp.dot(r_t * h_prev, params["U_h"]) + params["b_h"])
+            h_t = (1.0 - z_t) * h_prev + z_t * h_tilde
+            y_t = jax.nn.sigmoid(jnp.dot(h_t, params["W_out"]) + params["b_out"])
+            return h_t, y_t
+
+        h_0 = jnp.zeros((hidden_size,))
+        _, y_seq = jax.lax.scan(cell, h_0, x_seq)
+        return y_seq
+
+    def forward(params, x_batch):
+        return jax.vmap(lambda x_seq: forward_single(params, x_seq))(x_batch)
+
+    return init, forward
+
+
 def main() -> None:
     print("=" * 60)
     print("Experiment 6: Learning the Z-array (Level B)")
@@ -627,20 +676,23 @@ def main() -> None:
           f"mean={np.mean(z_means):.3f}, max={np.max(z_means):.3f}")
 
     # -----------------------------------------------------------------------
-    # Model A: MLP-small  (1 layer, 64 units)
+    # Model A: MLP-small, MLP-large, GRU-64
     # -----------------------------------------------------------------------
     key = jax.random.PRNGKey(42)
     results = {}
 
-    for label, hidden_sizes in [
-        ("MLP-small [64]", [64]),
-        ("MLP-large [128,128]", [128, 128]),
-    ]:
+    models_to_run = [
+        ("MLP-small [64]", lambda: make_mlp_model([64])),
+        ("MLP-large [128,128]", lambda: make_mlp_model([128, 128])),
+        ("GRU-64", lambda: make_gru_model(64)),
+    ]
+
+    for label, model_builder in models_to_run:
         print(f"\n{'='*50}")
         print(f"Model: {label}")
         print(f"{'='*50}")
 
-        init_fn, fwd_fn = make_mlp_model(hidden_sizes)
+        init_fn, fwd_fn = model_builder()
         key, subkey = jax.random.split(key)
         params = init_fn(subkey)
 
@@ -687,17 +739,17 @@ def main() -> None:
     sp_val_ood  = build_sp_dataset(N_VAL_OOD, OOD_MIN, OOD_MAX, PAD_TO)
     sp_results  = {}
 
-    for label, hidden_sizes in [
-        ("MLP-small [64]", [64]),
-        ("MLP-large [128,128]", [128, 128]),
-    ]:
+    for label, model_builder in models_to_run:
         print(f"\n{'='*50}")
         print(f"Model: {label}  (sp target)")
         print(f"{'='*50}")
 
-        init_fn, fwd_fn = make_mlp_model(hidden_sizes)
+        init_fn, fwd_fn = model_builder()
         key, subkey = jax.random.split(key)
         params = init_fn(subkey)
+
+        n_params = sum(np.prod(v.shape) for v in jax.tree_util.tree_leaves(params))
+        print(f"  Parameters: {n_params:,}")
 
         print(f"\nTraining ({N_EPOCHS} epochs)...")
         params = train_model(
