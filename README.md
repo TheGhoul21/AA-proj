@@ -1,89 +1,107 @@
 # CNN vs Exact Pattern Matching
 
-**Convolutional pattern matching, the failure function, and a real-valued bad-character rule**
+Luca Simonetti — Advanced Algorithms exam project.
 
-*Luca Simonetti — Advanced Algorithms project (April 2026)*
+The project compares classical string matching and neural pattern recognition:
+what information each solution represents, how it prepares the search, and
+which computations it can safely avoid. Interpretability is used to explain
+the relationship between the learned function and the search algorithm.
 
----
+## Current research
 
-## Overview
+Start with the [first algorithmic comparison and results](docs/algorithmic-comparison-first-results.md)
+(Italian), the [controlled distribution intervention](docs/distribution-intervention-results.md),
+then the [research program](docs/interpretability-research-program.md).
 
-This repository contains the code, experiments, and figures for an empirical and algorithmic study of the analogy between **convolutional neural networks (CNNs)** and **exact pattern-matching algorithms** (KMP, Boyer–Moore).
+Experiment 7 evaluates **all 1,024 windows** for each of two five-character
+patterns (`ABABC`, `ABABA`). It compares a constructed exact CNN, trained
+single-filter and multi-filter CNNs, additive approximations, and exact-search
+controls. The default run uses three initialization seeds and saves 90
+checkpoints across 12 training runs.
 
-The project explores two directions:
+Experiment 8 changes hard-negative frequencies while keeping the pattern,
+class balance, negative support, initialization and background examples fixed.
+Across 36 training runs, all final classifiers are exact on the 1,024 windows,
+but their substitution penalties change with the data. Ordering comparisons
+by neural score drops matches a simple frequency heuristic on this controlled
+mixture; both reach the best fixed-order expected cost. This is a window-level
+cost analysis, not an end-to-end text-search speed benchmark.
 
-- **D1 — Do learned CNN weights resemble preprocessing tables?**  
-  We show that every single-filter CNN, and even a multi-filter ReLU network, converges to a **Position-Specific Scoring Matrix (PSSM)**.  The per-window logit satisfies an exact additive identity that positions the learned penalty matrix as a real-valued, position-aware generalisation of the Boyer–Moore *bad-character* table.
+Key distinctions:
 
-- **D2 — Can learned filters be used as actual algorithmic preprocessing?**  
-  Using the recovered penalty table as a generalised bad-character shift table delivers a **4.06× reduction in elementary operations** over a naive scan on a 20 000-character text, with no loss of recall and identical F1.
+- A single filter is additive by construction; learning determines its weights.
+- A high-quality additive approximation need not preserve decisions at the
+  same threshold. Threshold recalibration is a separate question.
+- Recovering a pattern from weights allows classical preprocessing, but does
+  not show that the network learned the classical search procedure.
+- At zero penalty threshold, learned and binary penalties with the same
+  unique zero positions induce the same decisions and shifts in our scanner.
+- Lookup/comparison counts describe online work, not measured hardware speed.
 
-See [`paper.md`](paper.md) or [`paper.pdf`](paper.pdf) for the full write-up.
+The existing [paper](paper.md) and [PDF](paper.pdf) document the earlier
+experiments. Their broad interpretations of PSSM collapse, expressiveness,
+and scaling require revision in light of the current audit; they have not
+yet been rewritten around the new results.
 
----
+## Run
 
-## Repository Structure
-
-```
-.
-├── paper.md / paper.tex / paper.pdf   # Write-up
-├── LITERATURE_REVIEW.md               # SOTA survey on the CNN ↔ pattern-matching analogy
-├── main.py                            # Entry point
-├── model.py                           # CNN model definition (JAX / Flax)
-├── data.py                            # Data generation utilities
-├── patterns.py                        # Pattern definitions
-├── train.py                           # Training loop
-├── analysis.py                        # Weight analysis and PSSM recovery
-├── make_figures.py                    # All figure generation
-├── adversarial_check.py               # Adversarial / robustness checks
-├── experiment1.py  …  experiment5.py  # Individual experiment scripts
-└── figures/                           # Generated figures (PDF/PNG)
-```
-
----
-
-## Setup
-
-This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
+Python ≥ 3.13; dependencies are recorded in `pyproject.toml` and `uv.lock`.
 
 ```bash
-# Install dependencies
 uv sync
-
-# Run all experiments
-uv run python main.py
+uv run python experiment7.py
+uv run python experiment8.py
+uv run python -m pytest -q
 ```
 
-### Requirements
+With an existing environment, use `.venv/bin/python` instead of `uv run python`.
+The experiment supports `--seeds`, `--patterns` (length five), and `--output`.
+For example:
 
-- Python ≥ 3.13
-- JAX ≥ 0.10
-- Optax ≥ 0.2.8
-- NumPy ≥ 2.4
-- Matplotlib ≥ 3.10
+```bash
+uv run python experiment7.py --seeds 7 --output results/exhaustive-seed7
+```
 
----
+Artifacts in [`results/exhaustive/`](results/exhaustive/):
 
-## Experiments
+- `results.json`: protocol, source hashes, environment, checkpoint diagnostics,
+  and exact-search operation counts.
+- `functions.npz`: every evaluated function, window ordering, and loss histories.
+- `checkpoints/`: parameter snapshots, including initialization. These are for
+  analysis, not optimizer-resume checkpoints.
+- `trajectories.png` / `.pdf`: errors, interactions and separation during training.
+- `function_comparison.png` / `.pdf`: network versus additive approximation.
 
-| Script | Description |
-|--------|-------------|
-| `experiment1.py` | Single-filter CNN training and weight analysis |
-| `experiment2.py` | Multi-filter (K=4) ReLU network, PSSM verification |
-| `experiment3.py` | Position-penalty table extraction |
-| `experiment4.py` | Generalised bad-character shift table construction |
-| `experiment5.py` | Throughput benchmark (operations saved vs naive scan) |
+The exhaustive domain is used to describe the entire learned function. It is
+not a held-out generalization benchmark or a threshold-selection set. Training
+data and shuffle seeds are fixed; the three runs vary initialization only.
 
----
+Experiment 8 writes to [`results/distribution-intervention/`](results/distribution-intervention/):
+`results.json`, `functions.npz`, six controlled datasets, 36 final parameter
+sets, and two figures in PNG/PDF. Its 180 saved function evaluations describe
+training on isolated windows, a separate protocol from experiment 7.
 
-## Results
+## Code map
 
-- Single-filter and multi-filter CNNs both converge to exact PSSM structure (R² ≥ 0.987 across seeds)
-- Residual std 0.01 vs target std 23 for the multi-filter model
-- **4.06× operation reduction** on a 20 000-character text with Σ = {A, B, C, D}, m = 5
+| File | Role |
+|---|---|
+| `patterns.py` | Reference KMP, failure function and Z-array |
+| `data.py` | Planted matches and partial-prefix negatives |
+| `model.py` | Explicit single-filter and multi-filter JAX models |
+| `train.py` | Adam training with optional checkpoint observer |
+| `exhaustive_analysis.py` | Exact finite-domain additive projection and diagnostics |
+| `exact_search.py` | Counted naive, KMP and bad-character-only searches |
+| `experiment7.py` | Exhaustive analysis and controlled exact-search comparison |
+| `distribution_controls.py` | Matched negative distributions and exact comparison-order cost model |
+| `experiment8.py` | Distribution intervention, paired effects and order-selection controls |
+| `experiment1.py`–`experiment4.py` | Initial weight and representation analyses |
+| `experiment5.py` | Penalty scan, early exit and left-to-right bad-character shifts |
+| `experiment6.py` | Neural Z/sp prediction; causal target protocol needs revision |
+| `scaling_benchmark.py` | Earlier scaling and noisy-matching experiments |
+| `statistical_analysis.py` | Earlier repeated-run statistics |
+| `main.py` | CLI for experiments 1–6 and other original workflows |
+| `tests/` | Algorithm, identity, projection and training-observer checks |
 
----
-
-## License
-
-MIT
+Run `uv run python main.py --help` for the original CLI. Experiments 7 and 8
+currently have their own entry points. The simplified bad-character baseline is explicitly
+not full Boyer–Moore: it omits the good-suffix rule.

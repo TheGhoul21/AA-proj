@@ -23,7 +23,13 @@ def train(
     seed: int = 0,
     log_every: int = 10,
     loss_fn: Callable = default_loss_fn,
+    on_epoch: Callable[[int, Params], None] | None = None,
 ) -> tuple[Params, list[float]]:
+    """Train continuously; optional read-only observer sees epochs 0..n_epochs.
+
+    Epoch 0 is the initialization. Observers must not mutate params. Observing
+    checkpoints does not restart Adam or the data-shuffling random generator.
+    """
     opt = optax.adam(lr)
     opt_state = opt.init(params)
 
@@ -40,6 +46,8 @@ def train(
 
     history: list[float] = []
     rng = np.random.default_rng(seed)
+    if on_epoch is not None:
+        on_epoch(0, params)
     for epoch in range(n_epochs):
         perm = rng.permutation(N)
         epoch_loss = 0.0
@@ -53,6 +61,8 @@ def train(
             n_batches += 1
         avg = epoch_loss / max(1, n_batches)
         history.append(avg)
+        if on_epoch is not None:
+            on_epoch(epoch + 1, params)
         if epoch % log_every == 0 or epoch == n_epochs - 1:
             print(f"epoch {epoch:4d}  loss {avg:.4f}")
     return params, history
